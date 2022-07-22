@@ -93,7 +93,8 @@ Hart<URV>::Hart(unsigned hartIx, URV hartId, Memory& memory)
   : hartIx_(hartIx), memory_(memory), intRegs_(32),
     fpRegs_(32), vecRegs_(), syscall_(*this),
     pmpManager_(memory.size(), 1024*1024),
-    virtMem_(hartIx, memory, memory.pageSize(), pmpManager_, 1024 /* FIX: TLB size*/)
+    virtMem_(hartIx, memory, memory.pageSize(), pmpManager_, 1024 /* FIX: TLB size*/),
+    _zTable()
 {
   regionHasLocalMem_.resize(16);
   regionHasLocalDataMem_.resize(16);
@@ -2640,14 +2641,14 @@ Hart<URV>::fetchInst(URV virtAddr, uint64_t& physAddr, uint32_t& inst)
 template <typename URV>
 bool
 Hart<URV>::fetchInstPostTrigger(URV virtAddr, uint64_t& physAddr,
-				uint32_t& inst, FILE* traceFile)
+				uint32_t& inst, FILE* traceFile, commit_log_t* commit_log)
 {
   if (fetchInst(virtAddr, physAddr, inst))
     return true;
 
   // Fetch failed: take pending trigger-exception.
   URV info = virtAddr;
-  takeTriggerAction(traceFile, virtAddr, info, instCounter_, true);
+  takeTriggerAction(traceFile, virtAddr, info, instCounter_, true, commit_log);
   forceFetchFail_ = false;
 
   return false;
@@ -3399,13 +3400,13 @@ template <typename URV>
 void
 formatInstTrace(FILE* out, uint64_t tag, unsigned hartId, URV currPc,
 		const char* opcode, char resource, URV addr,
-		URV value, const char* assembly);
+		URV value, const char* assembly, commit_log_t* commit_log);
 
 template <>
 void
 formatInstTrace<uint32_t>(FILE* out, uint64_t tag, unsigned hartId, uint32_t currPc,
 		const char* opcode, char resource, uint32_t addr,
-		uint32_t value, const char* assembly)
+		uint32_t value, const char* assembly, commit_log_t* commit_log)
 {
   if (resource == 'r')
     {
@@ -3433,10 +3434,25 @@ template <>
 void
 formatInstTrace<uint64_t>(FILE* out, uint64_t tag, unsigned hartId, uint64_t currPc,
 		const char* opcode, char resource, uint64_t addr,
-		uint64_t value, const char* assembly)
+		uint64_t value, const char* assembly,  commit_log_t* commit_log)
 {
+  // This is the moment to hack into the whisper trace log and produce any output (PRAKHAR)
   fprintf(out, "#%" PRId64 " %d %016" PRIx64 " %8s %c %016" PRIx64 " %016" PRIx64 "  %s",
           tag, hartId, currPc, opcode, resource, addr, value, assembly);
+
+    commit_log_t log = {
+      tag,
+      hartId,
+      currPc,
+      opcode,
+      resource,
+      addr,
+      value,
+      assembly,
+    };
+
+    *commit_log = log;
+  
 }
 
 
@@ -3492,7 +3508,7 @@ static std::mutex printInstTraceMutex;
 template <typename URV>
 void
 Hart<URV>::printInstTrace(uint32_t inst, uint64_t tag, std::string& tmp,
-			  FILE* out)
+			  FILE* out, commit_log_t* commit_log)
 {
   if (not out)
     return;
@@ -3501,15 +3517,17 @@ Hart<URV>::printInstTrace(uint32_t inst, uint64_t tag, std::string& tmp,
   uint64_t physPc = pc_;
   decode(pc_, physPc, inst, di);
 
-  printDecodedInstTrace(di, tag, tmp, out);
+  printDecodedInstTrace(di, tag, tmp, out, commit_log);
 }
 
 
 template <typename URV>
 void
 Hart<URV>::printDecodedInstTrace(const DecodedInst& di, uint64_t tag, std::string& tmp,
-                                 FILE* out)
+                                 FILE* out, commit_log_t* commit_log)
 {
+  // Can Add logic to process the trace (PRAKHAR)
+  
   if (not out)
     return;
 
@@ -3518,6 +3536,29 @@ Hart<URV>::printDecodedInstTrace(const DecodedInst& di, uint64_t tag, std::strin
       printInstCsvTrace(di, out);
       return;
     }
+
+  // Process memory diff.
+  uint64_t strAddress = 0;
+  uint64_t strMemValue = 0;
+  unsigned strWriteSize = memory_.getLastWriteNewValue(hartIx_, strAddress, strMemValue);
+  if (strWriteSize > 0)
+  {
+    // Process mem store here (PRAKHR)
+    bool blockDone = _zTable.checkMemStr(strAddress, strMemValue, tag);
+
+
+    if(blockDone){
+      uint64_t blockSize =  _zTable._blockSize;
+      uint64_t instrNeededToZero = _zTable.getEndTag() - _zTable.getStartTag();
+      int64_t diff = _zTable.getDiff();
+
+      if(instrNeededToZero != blockSize){
+        fprintf(out, "#Size: %" PRId64 " %" PRId64 " %" PRId64 "\n", diff, blockSize, instrNeededToZero);
+        fprintf(out, "#Details: %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 " %" PRId64 " %016" PRIx64 " %016" PRIx64 "\n", 
+            diff, blockSize, _zTable.getStartTag(), _zTable.getEndTag(), instrNeededToZero, _zTable.getBlockStart(), _zTable.getBlockEnd());
+      }
+    }
+  }
 
   // Serialize to avoid jumbled output.
   std::lock_guard<std::mutex> guard(printInstTraceMutex);
@@ -3566,7 +3607,7 @@ Hart<URV>::printDecodedInstTrace(const DecodedInst& di, uint64_t tag, std::strin
     {
       value = intRegs_.read(reg);
       formatInstTrace<URV>(out, tag, hartIx_, currPc_, instBuff, 'r', reg,
-			   value, tmp.c_str());
+			   value, tmp.c_str(), commit_log);
       pending = true;
     }
 
@@ -3624,7 +3665,7 @@ Hart<URV>::printDecodedInstTrace(const DecodedInst& di, uint64_t tag, std::strin
   if (writeSize > 0)
     {
       if (pending)
-	fprintf(out, "  +\n");
+	      fprintf(out, "  +\n");
 
       if (sizeof(URV) == 4 and writeSize == 8)  // wide store
         {
@@ -3634,7 +3675,7 @@ Hart<URV>::printDecodedInstTrace(const DecodedInst& di, uint64_t tag, std::strin
         }
       else
         formatInstTrace<URV>(out, tag, hartIx_, currPc_, instBuff, 'm',
-                             URV(address), URV(memValue), tmp.c_str());
+                             URV(address), URV(memValue), tmp.c_str(), commit_log);
       pending = true;
     }
 
@@ -3654,7 +3695,7 @@ Hart<URV>::printDecodedInstTrace(const DecodedInst& di, uint64_t tag, std::strin
               if (pending)
                 fprintf(out, "  +\n");
               formatInstTrace<URV>(out, tag, hartIx_, currPc_, instBuff, 'm',
-                                   addr, val, tmp.c_str());
+                                   addr, val, tmp.c_str(), commit_log);
               pending = true;
             }
         }
@@ -3718,7 +3759,7 @@ Hart<URV>::printDecodedInstTrace(const DecodedInst& di, uint64_t tag, std::strin
     {
       if (pending) fprintf(out, "  +\n");
       formatInstTrace<URV>(out, tag, hartIx_, currPc_, instBuff, 'c',
-			   cvp.first, cvp.second, tmp.c_str());
+			   cvp.first, cvp.second, tmp.c_str(), commit_log);
       pending = true;
     }
 
@@ -3728,7 +3769,7 @@ Hart<URV>::printDecodedInstTrace(const DecodedInst& di, uint64_t tag, std::strin
     {
       // No diffs: Generate an x0 record.
       formatInstTrace<URV>(out, tag, hartIx_, currPc_, instBuff, 'r', 0, 0,
-			  tmp.c_str());
+			  tmp.c_str(), commit_log);
       fprintf(out, "\n");
     }
 }
@@ -4732,7 +4773,7 @@ handleExceptionForGdb(WdRiscv::Hart<URV>& hart, int fd);
 template <typename URV>
 bool
 Hart<URV>::takeTriggerAction(FILE* traceFile, URV pc, URV info,
-			     uint64_t& counter, bool beforeTiming)
+			     uint64_t& counter, bool beforeTiming, commit_log_t* commit_log)
 {
   // Check triggers configuration to determine action: take breakpoint
   // exception or enter debugger.
@@ -4762,7 +4803,7 @@ Hart<URV>::takeTriggerAction(FILE* traceFile, URV pc, URV info,
       readInstByVirtPc(currPc_, inst);
 
       std::string instStr;
-      printInstTrace(inst, counter, instStr, traceFile);
+      printInstTrace(inst, counter, instStr, traceFile, commit_log);
     }
 
   return enteredDebug;
@@ -4869,7 +4910,7 @@ reportInstsPerSec(uint64_t instCount, double elapsed, bool userStop)
 
 template <typename URV>
 bool
-Hart<URV>::logStop(const CoreException& ce, uint64_t counter, FILE* traceFile)
+Hart<URV>::logStop(const CoreException& ce, uint64_t counter, FILE* traceFile, commit_log_t* commit_log)
 {
   bool success = false;
   bool isRetired = false;
@@ -4895,7 +4936,7 @@ Hart<URV>::logStop(const CoreException& ce, uint64_t counter, FILE* traceFile)
       uint32_t inst = 0;
       readInstByVirtPc(currPc_, inst);
       std::string instStr;
-      printInstTrace(inst, counter, instStr, traceFile);
+      printInstTrace(inst, counter, instStr, traceFile, commit_log);
     }
 
   using std::cerr;
@@ -4935,7 +4976,7 @@ template <typename URV>
 inline
 bool
 Hart<URV>::fetchInstWithTrigger(URV addr, uint64_t& physAddr, uint32_t& inst,
-				FILE* file)
+				FILE* file, commit_log_t* commit_log)
 {
   // Process pre-execute address trigger and fetch instruction.
   bool hasTrig = hasActiveInstTrigger();
@@ -4946,7 +4987,7 @@ Hart<URV>::fetchInstWithTrigger(URV addr, uint64_t& physAddr, uint32_t& inst,
   bool fetchOk = true;
   if (triggerTripped_)
     {
-      if (not fetchInstPostTrigger(addr, physAddr, inst, file))
+      if (not fetchInstPostTrigger(addr, physAddr, inst, file, commit_log))
         {
           ++cycleCount_;
           return false;  // Next instruction in trap handler.
@@ -4966,7 +5007,7 @@ Hart<URV>::fetchInstWithTrigger(URV addr, uint64_t& physAddr, uint32_t& inst,
       ++cycleCount_;
 
       std::string instStr;
-      printInstTrace(inst, instCounter_, instStr, file);
+      printInstTrace(inst, instCounter_, instStr, file, commit_log);
 
       if (dcsrStep_)
         enterDebugMode_(DebugModeCause::STEP, pc_);
@@ -4986,7 +5027,7 @@ Hart<URV>::fetchInstWithTrigger(URV addr, uint64_t& physAddr, uint32_t& inst,
 
 template <typename URV>
 bool
-Hart<URV>::untilAddress(size_t address, FILE* traceFile)
+Hart<URV>::untilAddress(size_t address, FILE* traceFile, commit_log_t* commit_log)
 {
   std::string instStr;
   instStr.reserve(128);
@@ -5044,10 +5085,10 @@ Hart<URV>::untilAddress(size_t address, FILE* traceFile)
 
 	  ++instCounter_;
 
-          if (processExternalInterrupt(traceFile, instStr))
+          if (processExternalInterrupt(traceFile, instStr, commit_log))
             continue;  // Next instruction in trap handler.
 	  uint64_t physPc = 0;
-          if (not fetchInstWithTrigger(pc_, physPc, inst, traceFile))
+          if (not fetchInstWithTrigger(pc_, physPc, inst, traceFile, commit_log))
 	    continue;  // Next instruction in trap handler.
 
 	  // Decode unless match in decode cache.
@@ -5066,14 +5107,14 @@ Hart<URV>::untilAddress(size_t address, FILE* traceFile)
 	    {
               if (doStats)
                 accumulateInstructionStats(*di);
-	      printDecodedInstTrace(*di, instCounter_, instStr, traceFile);
+	      printDecodedInstTrace(*di, instCounter_, instStr, traceFile,  commit_log);
 	      continue;
 	    }
 
 	  if (triggerTripped_)
 	    {
 	      undoForTrigger();
-	      if (takeTriggerAction(traceFile, currPc_, currPc_, instCounter_, true))
+	      if (takeTriggerAction(traceFile, currPc_, currPc_, instCounter_, true, commit_log))
 		return true;
 	      continue;
 	    }
@@ -5086,18 +5127,18 @@ Hart<URV>::untilAddress(size_t address, FILE* traceFile)
 
 	  if (doStats)
 	    accumulateInstructionStats(*di);
-	  printDecodedInstTrace(*di, instCounter_, instStr, traceFile);
+	  printDecodedInstTrace(*di, instCounter_, instStr, traceFile,  commit_log);
 
 	  bool icountHit = (enableTriggers_ and
 			    icountTriggerHit(privMode_, isInterruptEnabled()));
 	  if (icountHit)
-	    if (takeTriggerAction(traceFile, pc_, pc_, instCounter_, false))
+	    if (takeTriggerAction(traceFile, pc_, pc_, instCounter_, false, commit_log))
 	      return true;
           prevPerfControl_ = perfControl_;
 	}
       catch (const CoreException& ce)
 	{
-	  return logStop(ce, instCounter_, traceFile);
+	  return logStop(ce, instCounter_, traceFile, commit_log);
 	}
     }
 
@@ -5174,7 +5215,7 @@ Hart<URV>::simpleRun()
     }
   catch (const CoreException& ce)
     {
-      success = logStop(ce, 0, nullptr);
+      success = logStop(ce, 0, nullptr, nullptr);
     }
 
   enableCsrTrace_ = true;
@@ -5472,7 +5513,7 @@ InstId Hart<URV>::getInstId(uint32_t inst) {
 
 template <typename URV>
 bool
-Hart<URV>::processExternalInterrupt(FILE* traceFile, std::string& instStr)
+Hart<URV>::processExternalInterrupt(FILE* traceFile, std::string& instStr, commit_log_t* commit_log)
 {
   if (instCounter_ >= alarmLimit_)
     {
@@ -5495,7 +5536,7 @@ Hart<URV>::processExternalInterrupt(FILE* traceFile, std::string& instStr)
 
 	readInstByVirtPc(currPc_, inst);
 	
-	printInstTrace(inst, instCounter_, instStr, traceFile);
+	printInstTrace(inst, instCounter_, instStr, traceFile, commit_log);
       return true;
     }
 
@@ -5507,7 +5548,7 @@ Hart<URV>::processExternalInterrupt(FILE* traceFile, std::string& instStr)
       initiateInterrupt(cause, pc_);
       uint32_t inst = 0; // Load interrupted inst.
       readInstByVirtPc(currPc_, inst);
-	printInstTrace(inst, instCounter_, instStr, traceFile);
+	printInstTrace(inst, instCounter_, instStr, traceFile, commit_log);
       ++cycleCount_;
       return true;
     }
@@ -5593,7 +5634,7 @@ Hart<URV>::loadQueueCommit(const DecodedInst& di)
 
 template <typename URV>
 void
-Hart<URV>::singleStep(FILE* traceFile)
+Hart<URV>::singleStep(FILE* traceFile,  commit_log_t* commit_log)
 {
   std::string instStr;
 
@@ -5614,11 +5655,11 @@ Hart<URV>::singleStep(FILE* traceFile)
 
       ++instCounter_;
 
-      if (processExternalInterrupt(traceFile, instStr))
+      if (processExternalInterrupt(traceFile, instStr, commit_log))
 	return;  // Next instruction in interrupt handler.
 
       uint64_t physPc = 0;
-      if (not fetchInstWithTrigger(pc_, physPc, inst, traceFile))
+      if (not fetchInstWithTrigger(pc_, physPc, inst, traceFile, commit_log))
         return;
 
       DecodedInst di;
@@ -5641,7 +5682,8 @@ Hart<URV>::singleStep(FILE* traceFile)
 	{
 	  if (doStats)
 	    accumulateInstructionStats(di);
-	  printDecodedInstTrace(di, instCounter_, instStr, traceFile);
+	  printDecodedInstTrace(di, instCounter_, instStr, traceFile, commit_log);
+    
 	  if (dcsrStep_ and not ebreakInstDebug_)
 	    enterDebugMode_(DebugModeCause::STEP, pc_);
 	  return;
@@ -5650,7 +5692,7 @@ Hart<URV>::singleStep(FILE* traceFile)
       if (triggerTripped_)
 	{
 	  undoForTrigger();
-	  takeTriggerAction(traceFile, currPc_, currPc_, instCounter_, true);
+	  takeTriggerAction(traceFile, currPc_, currPc_, instCounter_, true, commit_log);
 	  return;
 	}
 
@@ -5659,7 +5701,7 @@ Hart<URV>::singleStep(FILE* traceFile)
 
       if (doStats)
 	accumulateInstructionStats(di);
-      printInstTrace(inst, instCounter_, instStr, traceFile);
+      printInstTrace(inst, instCounter_, instStr, traceFile, commit_log);
 
       // If a register is used as a source by an instruction then any
       // pending load with same register as target is removed from the
@@ -5673,7 +5715,7 @@ Hart<URV>::singleStep(FILE* traceFile)
 			icountTriggerHit(privMode_, isInterruptEnabled()));
       if (icountHit)
 	{
-	  takeTriggerAction(traceFile, pc_, pc_, instCounter_, false);
+	  takeTriggerAction(traceFile, pc_, pc_, instCounter_, false, commit_log);
 	  return;
 	}
 
@@ -5690,7 +5732,7 @@ Hart<URV>::singleStep(FILE* traceFile)
       if (dcsrStep_ and not ebreakInstDebug_)
 	enterDebugMode_(DebugModeCause::STEP, pc_);
 
-      logStop(ce, instCounter_, traceFile);
+      logStop(ce, instCounter_, traceFile, commit_log);
     }
 }
 

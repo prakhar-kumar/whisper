@@ -42,6 +42,8 @@ namespace WdRiscv
     typedef Hart<URV> HartClass;
     typedef Core<URV> CoreClass;
 
+    System(){};
+
     /// Constructor: Construct a system with n (coreCount) cores each
     /// consisting of m (hartsPerCore) harts. The harts in this system
     /// are indexed with 0 to n*m - 1.  Each core is assigned a

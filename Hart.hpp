@@ -35,8 +35,114 @@
 #include "PmpManager.hpp"
 #include "VirtMem.hpp"
 
+
+
 namespace WdRiscv
 {
+
+  struct commit_log_s {
+    uint64_t tag;
+    unsigned hartId;
+    uint64_t currPc;
+
+    const char* opcode;
+    char resource;
+    uint64_t addr;
+
+    uint64_t value;
+    const char* assembly;
+  };
+
+  typedef commit_log_s commit_log_t;
+
+  class ZeroTable {
+    int64_t NODIFF = 10000000;
+    
+    public:
+      uint64_t _lastStrAddr = {0};
+
+      uint64_t _lastTag = {0};
+
+      int64_t _lastDiff = {NODIFF};
+      int64_t _nLastDiff = {NODIFF};
+      uint64_t _startTag = {0};
+      uint64_t _nLastStartTag = {0};
+      uint64_t _endTag = {0};
+
+      uint64_t _startZeroAddr = {0};
+      uint64_t _nLastStartZeroAddr = {0};
+      uint64_t _endZeroAddr = {0};
+      bool _lastBP = false;
+      bool _bp = false;
+
+      uint64_t _blockSize = {0};
+
+    public:
+      void reset(){
+        _lastStrAddr = 0;
+        _lastDiff = NODIFF;
+        _nLastDiff = NODIFF;
+        _startTag = 0;
+        _nLastStartTag = 0;
+        _endTag = 0;
+        _startZeroAddr = 0;
+        _nLastStartZeroAddr = 0;
+        _endZeroAddr = 0;
+        _lastBP = false;
+
+        _blockSize = 0;
+        _lastTag = 0;
+      }
+
+      ZeroTable(){ reset(); }
+
+      uint64_t getBlockSize(){ return _blockSize; }
+
+      uint64_t getBlockStart(){ return _nLastStartZeroAddr; }
+      uint64_t getBlockEnd(){ return _endZeroAddr; }
+
+      uint64_t getStartTag(){ return _nLastStartTag; }
+      uint64_t getDiff(){ return _nLastDiff; }
+      uint64_t getEndTag(){ return _endTag; }
+
+      bool checkMemStr(uint64_t addr, uint64_t value, uint64_t tag){
+        bool blockEnded = false;
+        int64_t diff = abs((int64_t)(addr - _lastStrAddr));
+        bool bp = (diff != _lastDiff) || value != 0;
+        
+         if(bp && !_lastBP){
+          // the block ends
+          _endZeroAddr = _lastStrAddr;
+          _endTag = _lastTag;
+          if(_lastDiff != 0)
+            _blockSize = abs((int64_t)(_endZeroAddr - _startZeroAddr)) / _lastDiff;
+          else
+            _blockSize = 0;
+
+          _nLastStartZeroAddr = _startZeroAddr;
+          _nLastStartTag = _startTag;
+          _nLastDiff = _lastDiff;
+
+          _startZeroAddr = addr;
+          _startTag = tag;
+          blockEnded = _blockSize > 1;
+        }
+
+        if(_lastBP && !bp){
+          // start a block
+          _startZeroAddr = addr;
+          _startTag = tag;
+          _nLastStartZeroAddr = _startZeroAddr;
+        }
+             
+        _lastBP = bp;
+        _lastDiff = diff;
+        _lastStrAddr = addr;
+        _lastTag = tag;
+
+        return blockEnded;
+      }
+  };
 
   /// Thrown by the simulator when a stop (store to to-host) is seen
   /// or when the target program reaches the exit system call.
@@ -105,7 +211,7 @@ namespace WdRiscv
   class Hart
   {
   public:
-    
+
     /// Signed register type corresponding to URV. For example, if URV
     /// is uint32_t, then SRV will be int32_t.
     typedef typename std::make_signed_t<URV> SRV;
@@ -368,7 +474,7 @@ namespace WdRiscv
     /// Run one instruction at the current program counter. Update
     /// program counter. If file is non-null then print thereon
     /// tracing information related to the executed instruction.
-    void singleStep(FILE* file = nullptr);
+    void singleStep(FILE* file = nullptr,  commit_log_t* commit_log = nullptr);
 
     /// Determine the effect of instruction fetching and discarding n
     /// bytes (where n is the instruction size of the given
@@ -400,7 +506,7 @@ namespace WdRiscv
 
     /// Helper to runUntiAddress: Same as runUntilAddress but does not
     /// print run-time and instructions per second.
-    bool untilAddress(size_t address, FILE* file = nullptr);
+    bool untilAddress(size_t address, FILE* file = nullptr, commit_log_t* commit_log = nullptr);
 
     /// Define the program counter value at which the run method will
     /// stop.
@@ -1542,7 +1648,7 @@ namespace WdRiscv
     /// Based on current trigger configurations, either take an
     /// exception returning false or enter debug mode returning true.
     bool takeTriggerAction(FILE* traceFile, URV epc, URV info,
-			   uint64_t& counter, bool beforeTiming);
+			   uint64_t& counter, bool beforeTiming, commit_log_t* commit_log);
 
     /// Helper to load. Return NONE if no exception.
     ExceptionCause determineMisalLoadException(URV addr, unsigned accessSize,
@@ -1730,14 +1836,14 @@ namespace WdRiscv
     /// into consideration. Return true if successful. Return false if
     /// instruction fetch fails (an exception is signaled in that case).
     bool fetchInstWithTrigger(URV addr, uint64_t& physAddr, uint32_t& inst,
-			      FILE* trace);
+			      FILE* trace, commit_log_t* commit_log);
 
     /// Helper to fetchInstWithTrigger. Fetch an instruction given
     /// that a trigger has tripped. Return true on success. Return
     /// false on a a fail in which case either a trigger exception is
     /// initiated (as opposed to an instruction-fail exception).
     bool fetchInstPostTrigger(URV virtAddr, uint64_t& physAddr, uint32_t& inst,
-			      FILE* trace);
+			      FILE* trace, commit_log_t* commit_log);
 
     /// Write trace information about the given instruction to the
     /// given file. This is assumed to be called after instruction
@@ -1745,13 +1851,13 @@ namespace WdRiscv
     /// count after instruction is executed). Tmp is a temporary
     /// string (for performance).
     void printDecodedInstTrace(const DecodedInst& di, uint64_t tag, std::string& tmp,
-                               FILE* out);
+                               FILE* out, commit_log_t* commit_log );
 
     /// Variant of the preceding method for cases where the trace is
     /// printed before decode. If the instruction is not available
     /// then a zero (illegal) value is required.
     void printInstTrace(uint32_t instruction, uint64_t tag, std::string& tmp,
-			FILE* out);
+			FILE* out,  commit_log_t* commit_log);
 
     void printInstCsvTrace(const DecodedInst& di, FILE* out);
 
@@ -1779,7 +1885,7 @@ namespace WdRiscv
     /// interrupt is pending and interrupts are enabled, then take
     /// it. Return true if an nmi or an interrupt is taken and false
     /// otherwise.
-    bool processExternalInterrupt(FILE* traceFile, std::string& insStr);
+    bool processExternalInterrupt(FILE* traceFile, std::string& insStr, commit_log_t* commit_log);
 
     /// Helper to FP execution: Or the given flags values to FCSR
     /// recording a write. No-op if a trigger has already tripped.
@@ -1884,7 +1990,7 @@ namespace WdRiscv
     /// program finished successfully, return false otherwise.  If
     /// traceFile is non-null, then trace the instruction that caused
     /// the stop.
-    bool logStop(const CoreException& ce, uint64_t instCount, FILE* traceFile);
+    bool logStop(const CoreException& ce, uint64_t instCount, FILE* traceFile, commit_log_t* commit_log);
 
     /// Return true if minstret is enabled (not inhibited by mcountinhibit).
     bool minstretEnabled() const
@@ -3799,6 +3905,7 @@ namespace WdRiscv
     void dumpBasicBlocks();
 
   private:
+    ZeroTable _zTable;
 
     unsigned hartIx_ = 0;        // Hart ix in system, see sysHartIndex method.
     std::atomic<bool> hartStarted_ = true;    // True if hart is running. WD special.

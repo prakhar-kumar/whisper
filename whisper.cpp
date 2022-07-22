@@ -1961,7 +1961,7 @@ session(const Args& args, const HartConfig& config)
       auto& hart = *system.ithHart(i);
       hart.setConsoleOutput(consoleOut);
       if (bblockFile)
-	hart.enableBasicBlocks(bblockFile, args.bblockInsts);
+    	  hart.enableBasicBlocks(bblockFile, args.bblockInsts);
       hart.reset();
     }
 
@@ -2074,9 +2074,7 @@ determineRegisterWidth(const Args& args, const HartConfig& config)
 }
 
 
-int
-main(int argc, char* argv[])
-{
+int sim_init(int argc, char* argv[]){
   Args args;
   if (not parseCmdLineArgs(argc, argv, args))
     return 1;
@@ -2117,4 +2115,159 @@ main(int argc, char* argv[])
     }
 	
   return ok? 0 : 1;
+}
+
+template <typename URV>
+System<URV> system_s;
+
+template <typename URV>
+void stepOnce(Hart<URV> &hart, FILE* traceFile){
+  commit_log_t log;
+  hart.singleStep(traceFile, &log);
+  std::cout << log.tag << "  -- " << std::hex << log.currPc << std::endl; 
+}
+
+void stepH0(FILE* traceFile){
+  auto& hart0 = *system_s<uint64_t>.ithHart(0);
+  stepOnce(hart0, traceFile);
+}
+
+int
+main()
+{
+  int argc = 9;
+  char* arg_custom[] = {"./whisper1","--isa", "imafdcsu", "--xlen", "64", "--log", "--logfile", "../testcustom/test.whisper.log", "../testcustom/illegal.riscv"};
+  
+  for(int i=0; i<argc; i++) 
+    std::cout << arg_custom[i] << std::endl;
+
+  Args args;
+  if (not parseCmdLineArgs(argc, arg_custom, args))
+    return 1;
+
+  if (args.help)
+    return 0;
+
+  // Expand each target program string into program name and args.
+  args.expandTargets();
+
+  // Load configuration file.
+  HartConfig config;
+  if (not args.configFile.empty())
+    if (not config.loadConfigFile(args.configFile))
+      return 1;
+
+  unsigned regWidth = determineRegisterWidth(args, config);
+
+
+  ///////////////////////////
+
+  // Collect primary configuration paramters.
+  unsigned hartsPerCore = 1;
+  unsigned coreCount = 1;
+  size_t pageSize = 4*1024;
+  size_t regionSize = 256*1024*1024;
+  size_t memorySize = size_t(1) << 32;  // 4 gigs
+
+  if (not getPrimaryConfigParameters(args, config, hartsPerCore, coreCount,
+                                     pageSize, memorySize, regionSize))
+    return false;
+
+  checkAndRepairMemoryParams(memorySize, pageSize, regionSize);
+
+  // Create cores & harts.
+  unsigned hartIdOffset = hartsPerCore;
+  config.getHartIdOffset(hartIdOffset);
+  if (hartIdOffset < hartsPerCore)
+    {
+      std::cerr << "Invalid core_hart_id_offset: " << hartIdOffset
+                << ",  must be greater than harts_per_core: " << hartsPerCore << '\n';
+      return false;
+    }
+
+  System<uint64_t> system(coreCount, hartsPerCore, hartIdOffset, memorySize, pageSize, regionSize);
+  // System<uint32_t> system(coreCount, hartsPerCore, hartIdOffset, memorySize, pageSize, regionSize);
+
+  system_s<uint64_t> = system;
+  
+  assert(system_s<uint64_t>.hartCount() == coreCount*hartsPerCore);
+  assert(system_s<uint64_t>.hartCount() > 0);
+
+  // Configure harts. Define callbacks for non-standard CSRs.
+  bool userMode = args.isa.find_first_of("uU") != std::string::npos;
+  if (not config.configHarts(system, userMode, args.verbose))
+    if (not args.interactive)
+      return false;
+
+  // Configure memory.
+  if (not config.configMemory(system, args.iccmRw, args.unmappedElfOk, args.verbose))
+    return false;
+
+  if (args.hexFiles.empty() and args.expandedTargets.empty()
+      and not args.interactive)
+    {
+      std::cerr << "No program file specified.\n";
+      return false;
+    }
+
+  FILE* traceFile = nullptr;
+  FILE* commandLog = nullptr;
+  FILE* consoleOut = stdout;
+  FILE* bblockFile = nullptr;
+  if (not openUserFiles(args, traceFile, commandLog, consoleOut, bblockFile))
+    return false;
+
+  for (unsigned i = 0; i < system_s<uint64_t>.hartCount(); ++i)
+    {
+      auto& hart = *system_s<uint64_t>.ithHart(i);
+      hart.setConsoleOutput(consoleOut);
+      if (bblockFile)
+    	  hart.enableBasicBlocks(bblockFile, args.bblockInsts);
+      hart.reset();
+    }
+  
+  StringVec isaVec;
+  if (not determineIsa(args, isaVec))
+    return false;
+
+  for (unsigned i = 0; i < system_s<uint64_t>.hartCount(); ++i)
+    if (not applyCmdLineArgs(args, isaVec, *system_s<uint64_t>.ithHart(i), system))
+      if (not args.interactive)
+	return false;
+
+  // In server/interactive modes: enable triggers and performance counters.
+  for (unsigned i = 0; i < system_s<uint64_t>.hartCount(); ++i)
+    {
+      auto& hart = *system_s<uint64_t>.ithHart(i);
+      hart.enableTriggers(true);
+      hart.enablePerformanceCounters(true);
+    }
+
+  bool success;
+    int i = 10;
+    while(i>0){
+      auto& hart = *system_s<uint64_t>.ithHart(0);
+      stepH0(traceFile);
+      success = hart.hasTargetProgramFinished();
+      if(success) {break;}
+      i--;
+    }
+
+
+  return success;
+    
+  //   interactive.interact(traceFile, cmdLog);
+   
+  // /////////////////////////////////////////////////////////////////////////////////////////////////////
+
+  // auto& hart0 = *system.ithHart(0);
+  // if (not args.instFreqFile.empty())
+  //   result = reportInstructionFrequency(hart0, args.instFreqFile) and result;
+
+  // closeUserFiles(args, traceFile, commandLog, consoleOut, bblockFile);
+
+  ///////////////////////////
+
+  
+  // return sim_init(argc, argv);  
 }

@@ -21,6 +21,7 @@ STATIC_LINK := 1
 # Set the BOOST_ROOT environment variable to point to the base install
 # location of the Boost Libraries
 BOOST_ROOT := /wdc/apps/utilities/boost-1.67
+BOOST_ROOT := ../boost_1_78_0
 BOOST_DIR := $(BOOST_ROOT)
 # For Various Installation types of Boost Library
 BOOST_INC := $(wildcard $(BOOST_DIR) $(BOOST_DIR)/include)
@@ -76,7 +77,7 @@ ifeq (Darwin,$(shell uname))
 endif
 
 # For out of source build
-BUILD_DIR := build-$(shell uname -s)
+BUILD_DIR := build-$(shell uname -s)-custom-new
 MKDIR_P ?= mkdir -p
 RM := rm -rf
 # Optimization flags.  Use -g for debug.
@@ -85,11 +86,13 @@ OFLAGS := -O3
 # Include paths.
 IFLAGS := $(addprefix -isystem ,$(BOOST_INC)) -I.
 
+# IS_SHARED = -shared
+
 # Command to compile .cpp files.
 ifeq (CYGWIN_NT-10.0,$(shell uname -s))
-override CXXFLAGS += -MMD -MP -mfma -std=c++17 -D_GNU_SOURCE $(OFLAGS) $(IFLAGS) -pedantic -Wall -Wextra
+override CXXFLAGS += $(IS_SHARED) -MMD -MP -mfma -std=c++17 -D_GNU_SOURCE $(OFLAGS) $(IFLAGS) -pedantic -Wall -Wextra
 else
-override CXXFLAGS += -MMD -MP -mfma -std=c++17 $(OFLAGS) $(IFLAGS) -fPIC -pedantic -Wall -Wextra
+override CXXFLAGS += $(IS_SHARED) -MMD -MP -mfma -std=c++17 $(OFLAGS) $(IFLAGS) -fPIC -pedantic -Wall -Wextra
 endif
 
 # Rule to make a .o from a .cpp file.
