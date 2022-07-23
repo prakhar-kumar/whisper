@@ -2073,80 +2073,37 @@ determineRegisterWidth(const Args& args, const HartConfig& config)
   return xlen;
 }
 
-
-int sim_init(int argc, char* argv[]){
-  Args args;
-  if (not parseCmdLineArgs(argc, argv, args))
-    return 1;
-
-  if (args.help)
-    return 0;
-
-  // Expand each target program string into program name and args.
-  args.expandTargets();
-
-  // Load configuration file.
-  HartConfig config;
-  if (not args.configFile.empty())
-    if (not config.loadConfigFile(args.configFile))
-      return 1;
-
-  unsigned regWidth = determineRegisterWidth(args, config);
-
-  bool ok = true;
-
-  try
-    {
-      if (regWidth == 32)
-	ok = session<uint32_t>(args, config);
-      else if (regWidth == 64)
-	ok = session<uint64_t>(args, config);
-      else
-	{
-	  std::cerr << "Invalid register width: " << regWidth;
-	  std::cerr << " -- expecting 32 or 64\n";
-	  ok = false;
-	}
-    }
-  catch (std::exception& e)
-    {
-      std::cerr << e.what() << '\n';
-      ok = false;
-    }
-	
-  return ok? 0 : 1;
-}
-
 template <typename URV>
 System<URV> system_s;
 
-template <typename URV>
-void stepOnce(Hart<URV> &hart, FILE* traceFile){
-  commit_log_t log;
-  hart.singleStep(traceFile, &log);
-  std::cout << log.tag << "  -- " << std::hex << log.currPc << std::endl; 
-}
+// template <typename URV>
+// void stepOnce(Hart<URV> &hart, FILE* traceFile){
+//   commit_log_t log;
+//   hart.singleStep(traceFile, &log);
+//   std::cout << log.tag << "  -- " << std::hex << log.currPc << std::endl; 
+// }
 
-void stepH0(FILE* traceFile){
-  auto& hart0 = *system_s<uint64_t>.ithHart(0);
-  stepOnce(hart0, traceFile);
-}
+// void stepH0(FILE* traceFile){
+//   auto& hart0 = *system_s<uint64_t>.ithHart(0);
+//   stepOnce(hart0, traceFile);
+// }
 
-int
-main()
+
+bool
+sim_init()
 {
   int argc = 9;
-  char* arg_custom[] = {"./whisper1","--isa", "imafdcsu", "--xlen", "64", "--log", "--logfile", "../testcustom/test.whisper.log", "../testcustom/illegal.riscv"};
+  char* arg_custom[] = {"./whisper1","--isa", "imafdcsu", "--xlen", "64", "--log", "--logfile", "./test.whisper.log", "./test.riscv"};
   
   for(int i=0; i<argc; i++) 
     std::cout << arg_custom[i] << std::endl;
 
   Args args;
   if (not parseCmdLineArgs(argc, arg_custom, args))
-    return 1;
+    return false;
 
   if (args.help)
-    return 0;
+    return true;
 
   // Expand each target program string into program name and args.
   args.expandTargets();
@@ -2243,11 +2200,17 @@ main()
       hart.enablePerformanceCounters(true);
     }
 
-  bool success;
+    return true;
+}
+
+
+void stepH0(commit_log_t* log){
+    bool success;
     int i = 10;
     while(i>0){
       auto& hart = *system_s<uint64_t>.ithHart(0);
-      stepH0(traceFile);
+      hart.singleStep(nullptr, log);
+      std::cout << log->tag << "  -- " << std::hex << log->currPc << std::endl; 
       success = hart.hasTargetProgramFinished();
       if(success) {break;}
       i--;
@@ -2255,19 +2218,12 @@ main()
 
 
   return success;
-    
-  //   interactive.interact(traceFile, cmdLog);
-   
-  // /////////////////////////////////////////////////////////////////////////////////////////////////////
+}
 
-  // auto& hart0 = *system.ithHart(0);
-  // if (not args.instFreqFile.empty())
-  //   result = reportInstructionFrequency(hart0, args.instFreqFile) and result;
 
-  // closeUserFiles(args, traceFile, commandLog, consoleOut, bblockFile);
-
-  ///////////////////////////
-
-  
-  // return sim_init(argc, argv);  
+int main(){
+  std::cout << "Loaded Whisper";
+  sim_init();
+  commit_log_t log;
+  stepH0(&log);
 }
