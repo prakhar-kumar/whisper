@@ -2205,19 +2205,15 @@ sim_init()
 
 
 void stepH0(commit_log_t* log){
-    bool success;
     int i = 10;
     while(i>0){
       auto& hart = *system_s<uint64_t>.ithHart(0);
       hart.singleStep(nullptr, log);
       std::cout << log->tag << "  -- " << std::hex << log->currPc << std::endl; 
-      success = hart.hasTargetProgramFinished();
+      bool success = hart.hasTargetProgramFinished();
       if(success) {break;}
       i--;
     }
-
-
-  return success;
 }
 
 
